@@ -6,4 +6,11 @@
 // NMEA GGA position updates while reading RTCM corrections. net/http exposes the
 // response body as a read-only stream, which is insufficient for that full-duplex
 // rover use case.
+//
+// Rover responses use the standard HTTP body decoder, while GGA writes retain
+// direct access to the connection. Sources publish chunked HTTP POST bodies.
+// Managed copies take ownership of closeable endpoints so cancellation can
+// interrupt I/O. Callbacks must honor their context and must not retain borrowed
+// buffers. Source body failures report delivery uncertainty instead of guessing
+// whether consumed correction bytes can safely be replayed.
 package ntrip

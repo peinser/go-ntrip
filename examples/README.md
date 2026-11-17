@@ -34,6 +34,10 @@ go run ./examples/dispatch-sinks \
 ```
 
 Use `-device /dev/ttyACM0` only when the target accepts raw RTCM bytes directly.
+Sinks are written synchronously: the slowest sink applies backpressure to all.
+The stream owns and closes all sinks, including stdout. For bounded cancellation,
+the chosen device/file implementation must unblock a pending write when closed.
+Fixed-position GGA timestamps are refreshed every five seconds.
 
 ## nearest-mountpoint
 
@@ -53,7 +57,10 @@ For CORSHub, mountpoint `*` can be preferable because the caster can choose dyna
 
 ## source-publisher
 
-Publishes RTCM bytes from stdin or a file to a caster using NTRIP v2 `PUT`.
+Publishes RTCM bytes from stdin or a file to a caster using chunked NTRIP v2 `POST`.
+The stream owns the input and closes it on return or cancellation. Connection
+setup retries transient failures; a body-write failure stops with delivery
+uncertainty rather than replaying or discarding input on another connection.
 
 ```sh
 go run ./examples/source-publisher \

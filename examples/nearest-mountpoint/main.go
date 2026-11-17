@@ -54,7 +54,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("dial udp sink: %v", err)
 	}
-	defer conn.Close()
 
 	stream := ntrip.NewRoverStream(ntrip.StreamConfig{
 		Rover:           ntrip.RoverConfig{URL: streamURL, Credentials: ntrip.Credentials{Username: username, Password: password}},
@@ -63,12 +62,38 @@ func main() {
 	})
 	sentence, err := ntrip.FormatGGA(ntrip.GGA{Time: time.Now().UTC(), Latitude: lat, Longitude: lon, FixQuality: ntrip.FixGPS, Satellites: 12, HDOP: 1.0})
 	if err != nil {
+		_ = conn.Close()
 		log.Fatalf("format gga: %v", err)
 	}
 	if err := stream.SetGGA(sentence); err != nil {
+		_ = conn.Close()
 		log.Fatalf("set gga: %v", err)
 	}
-	if err := stream.RunToWriter(ctx, conn); err != nil && ctx.Err() == nil {
+	updatesCtx, stopUpdates := context.WithCancel(ctx)
+	updatesDone := make(chan struct{})
+	go func() {
+		defer close(updatesDone)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-updatesCtx.Done():
+				return
+			case <-ticker.C:
+				sentence, err := ntrip.FormatGGA(ntrip.GGA{Time: time.Now().UTC(), Latitude: lat, Longitude: lon, FixQuality: ntrip.FixGPS, Satellites: 12, HDOP: 1.0})
+				if err == nil {
+					err = stream.SetGGA(sentence)
+				}
+				if err != nil {
+					log.Printf("update GGA: %v", err)
+				}
+			}
+		}
+	}()
+	err = stream.RunToWriter(ctx, conn)
+	stopUpdates()
+	<-updatesDone
+	if err != nil && ctx.Err() == nil {
 		log.Fatalf("ntrip stream stopped: %v", err)
 	}
 }

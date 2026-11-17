@@ -2,16 +2,23 @@ package ntrip
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"fmt"
 	"io"
 	"math"
-	"net/http/httputil"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
-const earthRadiusMeters = 6371010.0
+const (
+	earthRadiusMeters = 6371010.0
+	// Bound parsed-object amplification, not just the downloaded byte count.
+	maxSourcetableRecords  = 100_000
+	maxSourcetableWarnings = 1_000
+)
 
 type Sourcetable struct {
 	Casters  []CasterEntry
@@ -20,6 +27,7 @@ type Sourcetable struct {
 	Raw      []string
 	Header   map[string][]string
 	Warnings []ParseWarning
+	Unknown  []string
 }
 
 type ParseWarning struct {
@@ -49,6 +57,7 @@ type CasterEntry struct {
 	FallbackPort int
 	Misc         string
 	Raw          string
+	Extra        []string
 }
 
 type NetworkEntry struct {
@@ -61,6 +70,7 @@ type NetworkEntry struct {
 	RegistrationAddress string
 	Misc                string
 	Raw                 string
+	Extra               []string
 }
 
 type StreamEntry struct {
@@ -83,6 +93,7 @@ type StreamEntry struct {
 	Bitrate        int
 	Misc           string
 	Raw            string
+	Extra          []string
 }
 
 type StreamDistance struct {
@@ -91,7 +102,14 @@ type StreamDistance struct {
 }
 
 func FetchSourcetable(ctx context.Context, cfg SourcetableConfig) (Sourcetable, error) {
+	if cfg.MaxBodyBytes == math.MaxInt64 {
+		return Sourcetable{}, fmt.Errorf("%w: sourcetable limit is too large", ErrInvalidConfig)
+	}
 	ep, err := parseEndpoint(cfg.URL)
+	if err != nil {
+		return Sourcetable{}, err
+	}
+	request, err := requestBytes("GET", ep, userAgent(cfg.UserAgent), cfg.Credentials, cfg.Headers, nil)
 	if err != nil {
 		return Sourcetable{}, err
 	}
@@ -99,10 +117,12 @@ func FetchSourcetable(ctx context.Context, cfg SourcetableConfig) (Sourcetable, 
 	if err != nil {
 		return Sourcetable{}, err
 	}
-	defer conn.Close()
-	stopContextClose := closeOnContext(ctx, conn)
-	defer stopContextClose()
-	if err := writeRequest(conn, writeTimeout(cfg.WriteTimeout), "GET", ep, userAgent(cfg.UserAgent), cfg.Credentials, cfg.Headers, nil); err != nil {
+	closeConn := closeWithContext(ctx, conn)
+	defer closeConn()
+	if _, err := writeFull(conn, request, writeTimeout(cfg.WriteTimeout)); err != nil {
+		if ctx.Err() != nil {
+			return Sourcetable{}, ctx.Err()
+		}
 		return Sourcetable{}, fmt.Errorf("write ntrip sourcetable request: %w", err)
 	}
 	reader := bufio.NewReaderSize(conn, 32*1024)
@@ -113,14 +133,35 @@ func FetchSourcetable(ctx context.Context, cfg SourcetableConfig) (Sourcetable, 
 		return err
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return Sourcetable{}, ctx.Err()
+		}
 		return Sourcetable{}, err
 	}
 	if err := expectOK(resp); err != nil {
 		return Sourcetable{}, err
 	}
-	data, err := io.ReadAll(responseBodyReader(resp, reader))
+	timeout := cfg.BodyTimeout
+	if timeout <= 0 {
+		timeout = DefaultBodyTimeout
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return Sourcetable{}, err
+	}
+	limit := cfg.MaxBodyBytes
+	if limit <= 0 {
+		limit = DefaultMaxSourcetableBytes
+	}
+	// Avoid limit+1 overflow while keeping one byte to distinguish exact limits.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if ctx.Err() != nil {
+		return Sourcetable{}, ctx.Err()
+	}
 	if err != nil {
 		return Sourcetable{}, err
+	}
+	if int64(len(data)) > limit {
+		return Sourcetable{}, fmt.Errorf("%w: sourcetable exceeds %d bytes", ErrBadResponse, limit)
 	}
 	st, err := ParseSourcetable(string(data))
 	if err != nil {
@@ -130,54 +171,56 @@ func FetchSourcetable(ctx context.Context, cfg SourcetableConfig) (Sourcetable, 
 	return st, nil
 }
 
-func responseBodyReader(resp response, reader io.Reader) io.Reader {
-	for _, value := range resp.Header["Transfer-Encoding"] {
-		for _, part := range strings.Split(value, ",") {
-			if strings.EqualFold(strings.TrimSpace(part), "chunked") {
-				return httputil.NewChunkedReader(reader)
-			}
-		}
-	}
-	if values := resp.Header["Content-Length"]; len(values) > 0 {
-		if n, err := strconv.ParseInt(values[0], 10, 64); err == nil && n >= 0 {
-			return io.LimitReader(reader, n)
-		}
-	}
-	return reader
-}
-
 func ParseSourcetable(input string) (Sourcetable, error) {
 	var st Sourcetable
 	scanner := bufio.NewScanner(strings.NewReader(input))
 	scanner.Buffer(make([]byte, 0, 4096), 1024*1024)
 	lineNo := 0
+	ended := false
 	for scanner.Scan() {
 		lineNo++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || line == "ENDSOURCETABLE" {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		if ended {
+			return Sourcetable{}, fmt.Errorf("%w: data after ENDSOURCETABLE", ErrBadResponse)
+		}
+		if line == "ENDSOURCETABLE" {
+			ended = true
 			continue
 		}
 		st.Raw = append(st.Raw, line)
-		fields := strings.Split(line, ";")
-		switch fields[0] {
+		if len(st.Raw) > maxSourcetableRecords {
+			return Sourcetable{}, fmt.Errorf("%w: sourcetable exceeds %d records", ErrBadResponse, maxSourcetableRecords)
+		}
+		kind, _, _ := strings.Cut(line, ";")
+		switch kind {
 		case "CAS":
-			entry, warnings := parseCaster(fields, line, lineNo)
+			entry, warnings := parseCaster(strings.Split(line, ";"), line, lineNo)
 			st.Casters = append(st.Casters, entry)
 			st.Warnings = append(st.Warnings, warnings...)
 		case "NET":
-			entry, warnings := parseNetwork(fields, line, lineNo)
+			entry, warnings := parseNetwork(strings.Split(line, ";"), line, lineNo)
 			st.Networks = append(st.Networks, entry)
 			st.Warnings = append(st.Warnings, warnings...)
 		case "STR":
-			entry, warnings := parseStream(fields, line, lineNo)
+			entry, warnings := parseStream(strings.Split(line, ";"), line, lineNo)
 			st.Streams = append(st.Streams, entry)
 			st.Warnings = append(st.Warnings, warnings...)
 		default:
-			st.Warnings = append(st.Warnings, ParseWarning{Line: lineNo, Field: "record", Value: fields[0], Err: fmt.Errorf("unknown sourcetable record")})
+			st.Unknown = append(st.Unknown, line)
+			st.Warnings = append(st.Warnings, ParseWarning{Line: lineNo, Field: "record", Value: kind, Err: fmt.Errorf("unknown sourcetable record")})
+		}
+		if len(st.Warnings) > maxSourcetableWarnings {
+			return Sourcetable{}, fmt.Errorf("%w: sourcetable exceeds %d parse warnings", ErrBadResponse, maxSourcetableWarnings)
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return Sourcetable{}, err
+	}
+	if !ended {
+		return Sourcetable{}, fmt.Errorf("%w: missing ENDSOURCETABLE", ErrBadResponse)
 	}
 	return st, nil
 }
@@ -193,8 +236,16 @@ func (st Sourcetable) String() string {
 	for _, entry := range st.Streams {
 		lines = append(lines, entry.String())
 	}
+	lines = append(lines, st.Unknown...)
 	lines = append(lines, "ENDSOURCETABLE")
 	return strings.Join(lines, "\r\n") + "\r\n"
+}
+
+// RawString returns the original records in their original order, including
+// malformed/unknown fields. String instead serializes the current typed values.
+// Both methods normalize line endings to CRLF and include the table terminator.
+func (st Sourcetable) RawString() string {
+	return strings.Join(append(append([]string(nil), st.Raw...), "ENDSOURCETABLE"), "\r\n") + "\r\n"
 }
 
 func (st Sourcetable) HasStream(mountpoint string) (StreamEntry, bool) {
@@ -216,22 +267,27 @@ func (st Sourcetable) Network(identifier string) (NetworkEntry, bool) {
 }
 
 func (st Sourcetable) NearestStreams(latitude, longitude float64, maxMeters float64) []StreamDistance {
+	if !validPosition(latitude, longitude) || !finite(maxMeters) {
+		return nil
+	}
 	out := make([]StreamDistance, 0, len(st.Streams))
 	for _, stream := range st.Streams {
+		if !validPosition(stream.Latitude, stream.Longitude) {
+			continue
+		}
 		meters := DistanceMeters(latitude, longitude, stream.Latitude, stream.Longitude)
 		if maxMeters <= 0 || meters <= maxMeters {
 			out = append(out, StreamDistance{Stream: stream, Meters: meters})
 		}
 	}
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j].Meters < out[j-1].Meters; j-- {
-			out[j], out[j-1] = out[j-1], out[j]
-		}
-	}
+	slices.SortStableFunc(out, func(a, b StreamDistance) int { return cmp.Compare(a.Meters, b.Meters) })
 	return out
 }
 
 func DistanceMeters(latA, lonA, latB, lonB float64) float64 {
+	if !validPosition(latA, lonA) || !validPosition(latB, lonB) {
+		return math.NaN()
+	}
 	lat1 := latA * math.Pi / 180
 	lat2 := latB * math.Pi / 180
 	lon1 := lonA * math.Pi / 180
@@ -239,7 +295,12 @@ func DistanceMeters(latA, lonA, latB, lonB float64) float64 {
 	dLat := lat2 - lat1
 	dLon := lon2 - lon1
 	a := math.Sin(dLat/2)*math.Sin(dLat/2) + math.Cos(lat1)*math.Cos(lat2)*math.Sin(dLon/2)*math.Sin(dLon/2)
+	a = max(0, min(1, a))
 	return earthRadiusMeters * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+}
+
+func validPosition(latitude, longitude float64) bool {
+	return finite(latitude) && finite(longitude) && latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180
 }
 
 func parseCaster(fields []string, raw string, line int) (CasterEntry, []ParseWarning) {
@@ -251,12 +312,13 @@ func parseCaster(fields []string, raw string, line int) (CasterEntry, []ParseWar
 		Operator:     p.string(4, "operator"),
 		NMEA:         p.bool(5, "nmea", "0"),
 		Country:      p.string(6, "country"),
-		Latitude:     p.float(7, "latitude"),
-		Longitude:    p.float(8, "longitude"),
+		Latitude:     p.coordinate(7, "latitude", 90),
+		Longitude:    p.coordinate(8, "longitude", 180),
 		FallbackHost: p.string(9, "fallback_host"),
 		FallbackPort: p.int(10, "fallback_port"),
 		Misc:         p.string(11, "misc"),
 		Raw:          raw,
+		Extra:        fields[min(len(fields), 12):],
 	}
 	return entry, p.warnings
 }
@@ -273,6 +335,7 @@ func parseNetwork(fields []string, raw string, line int) (NetworkEntry, []ParseW
 		RegistrationAddress: p.string(7, "registration_address"),
 		Misc:                p.string(8, "misc"),
 		Raw:                 raw,
+		Extra:               fields[min(len(fields), 9):],
 	}
 	return entry, p.warnings
 }
@@ -288,8 +351,8 @@ func parseStream(fields []string, raw string, line int) (StreamEntry, []ParseWar
 		NavSystem:      p.string(6, "nav_system"),
 		Network:        p.string(7, "network"),
 		Country:        p.string(8, "country"),
-		Latitude:       p.float(9, "latitude"),
-		Longitude:      p.float(10, "longitude"),
+		Latitude:       p.coordinate(9, "latitude", 90),
+		Longitude:      p.coordinate(10, "longitude", 180),
 		NMEA:           p.bool(11, "nmea", "0"),
 		Solution:       p.bool(12, "solution", "0"),
 		Generator:      p.string(13, "generator"),
@@ -299,20 +362,21 @@ func parseStream(fields []string, raw string, line int) (StreamEntry, []ParseWar
 		Bitrate:        p.int(17, "bitrate"),
 		Misc:           p.string(18, "misc"),
 		Raw:            raw,
+		Extra:          fields[min(len(fields), 19):],
 	}
 	return entry, p.warnings
 }
 
 func (c CasterEntry) String() string {
-	return strings.Join([]string{"CAS", c.Host, strconv.Itoa(c.Port), c.Identifier, c.Operator, formatBool01(c.NMEA), c.Country, formatFloat(c.Latitude), formatFloat(c.Longitude), c.FallbackHost, strconv.Itoa(c.FallbackPort), c.Misc}, ";")
+	return strings.Join(append([]string{"CAS", c.Host, strconv.Itoa(c.Port), c.Identifier, c.Operator, formatBool01(c.NMEA), c.Country, formatFloat(c.Latitude), formatFloat(c.Longitude), c.FallbackHost, strconv.Itoa(c.FallbackPort), c.Misc}, c.Extra...), ";")
 }
 
 func (n NetworkEntry) String() string {
-	return strings.Join([]string{"NET", n.Identifier, n.Operator, n.Authentication, formatBoolYN(n.Fee), n.NetworkInfoURL, n.StreamInfoURL, n.RegistrationAddress, n.Misc}, ";")
+	return strings.Join(append([]string{"NET", n.Identifier, n.Operator, n.Authentication, formatBoolYN(n.Fee), n.NetworkInfoURL, n.StreamInfoURL, n.RegistrationAddress, n.Misc}, n.Extra...), ";")
 }
 
 func (s StreamEntry) String() string {
-	return strings.Join([]string{"STR", s.Mountpoint, s.Identifier, s.Format, s.FormatDetails, s.Carrier, s.NavSystem, s.Network, s.Country, formatFloat(s.Latitude), formatFloat(s.Longitude), formatBool01(s.NMEA), formatBool01(s.Solution), s.Generator, s.Compression, s.Authentication, formatBoolYN(s.Fee), strconv.Itoa(s.Bitrate), s.Misc}, ";")
+	return strings.Join(append([]string{"STR", s.Mountpoint, s.Identifier, s.Format, s.FormatDetails, s.Carrier, s.NavSystem, s.Network, s.Country, formatFloat(s.Latitude), formatFloat(s.Longitude), formatBool01(s.NMEA), formatBool01(s.Solution), s.Generator, s.Compression, s.Authentication, formatBoolYN(s.Fee), strconv.Itoa(s.Bitrate), s.Misc}, s.Extra...), ";")
 }
 
 type parser struct {
@@ -339,18 +403,23 @@ func (p *parser) int(index int, name string) int {
 		p.warn(name, value, err)
 		return 0
 	}
+	if parsed < 0 || ((name == "port" || name == "fallback_port") && parsed > 65535) || (name == "port" && parsed == 0) {
+		p.warn(name, value, fmt.Errorf("integer out of range"))
+		return 0
+	}
 	return parsed
 }
 
-func (p *parser) float(index int, name string) float64 {
+func (p *parser) coordinate(index int, name string, limit float64) float64 {
 	value := p.string(index, name)
 	if value == "" {
-		return 0
+		p.warn(name, value, fmt.Errorf("missing coordinate"))
+		return math.NaN()
 	}
 	parsed, err := strconv.ParseFloat(value, 64)
-	if err != nil {
-		p.warn(name, value, err)
-		return 0
+	if err != nil || !finite(parsed) || math.Abs(parsed) > limit {
+		p.warn(name, value, fmt.Errorf("invalid coordinate"))
+		return math.NaN()
 	}
 	return parsed
 }
@@ -358,9 +427,22 @@ func (p *parser) float(index int, name string) float64 {
 func (p *parser) bool(index int, name string, falseValue string) bool {
 	value := p.string(index, name)
 	if value == "" {
+		p.warn(name, value, fmt.Errorf("missing boolean"))
 		return false
 	}
-	return strings.ToUpper(value) != falseValue
+	trueValue := "1"
+	if falseValue == "N" {
+		trueValue = "Y"
+	}
+	switch strings.ToUpper(value) {
+	case falseValue:
+		return false
+	case trueValue:
+		return true
+	default:
+		p.warn(name, value, fmt.Errorf("expected %s or %s", falseValue, trueValue))
+		return false
+	}
 }
 
 func (p *parser) warn(field, value string, err error) {
@@ -382,5 +464,8 @@ func formatBoolYN(value bool) string {
 }
 
 func formatFloat(value float64) string {
-	return strconv.FormatFloat(value, 'f', 4, 64)
+	if !finite(value) {
+		return ""
+	}
+	return strconv.FormatFloat(value, 'f', -1, 64)
 }

@@ -3,19 +3,22 @@ package ntrip
 import (
 	"crypto/tls"
 	"log/slog"
+	"math"
 	"net"
 	"time"
 )
 
 const (
-	DefaultUserAgent       = "NTRIP go-ntrip/0.1"
-	DefaultDialTimeout     = 10 * time.Second
-	DefaultHeaderTimeout   = 10 * time.Second
-	DefaultWriteTimeout    = 5 * time.Second
-	DefaultReadIdleTimeout = 60 * time.Second
-	DefaultMaxHeaderBytes  = 64 * 1024
-	DefaultReconnectMin    = 500 * time.Millisecond
-	DefaultReconnectMax    = 30 * time.Second
+	DefaultUserAgent           = "NTRIP go-ntrip/0.1"
+	DefaultDialTimeout         = 10 * time.Second
+	DefaultHeaderTimeout       = 10 * time.Second
+	DefaultWriteTimeout        = 5 * time.Second
+	DefaultReadIdleTimeout     = 60 * time.Second
+	DefaultMaxHeaderBytes      = 64 * 1024
+	DefaultMaxSourcetableBytes = 8 * 1024 * 1024
+	DefaultBodyTimeout         = 30 * time.Second
+	DefaultReconnectMin        = 500 * time.Millisecond
+	DefaultReconnectMax        = 30 * time.Second
 )
 
 type Credentials struct {
@@ -47,7 +50,6 @@ type SourceConfig struct {
 	TLSConfig      *tls.Config
 	Dialer         *net.Dialer
 	Headers        map[string]string
-	NoChunked      bool
 }
 
 type SourcetableConfig struct {
@@ -61,12 +63,17 @@ type SourcetableConfig struct {
 	TLSConfig      *tls.Config
 	Dialer         *net.Dialer
 	Headers        map[string]string
+	// BodyTimeout bounds the whole download, not just idle time between reads.
+	BodyTimeout  time.Duration
+	MaxBodyBytes int64
 }
 
 type BackoffConfig struct {
 	Min    time.Duration
 	Max    time.Duration
 	Factor float64
+	// ResetAfter is the minimum healthy session duration before resetting backoff.
+	ResetAfter time.Duration
 }
 
 type StreamConfig struct {
@@ -96,10 +103,17 @@ func (b BackoffConfig) normalized() BackoffConfig {
 	if b.Max < b.Min {
 		b.Max = b.Min
 	}
-	if b.Factor < 1.1 {
+	if !finite(b.Factor) || b.Factor < 1.1 {
 		b.Factor = 2
 	}
+	if b.ResetAfter <= 0 {
+		b.ResetAfter = 30 * time.Second
+	}
 	return b
+}
+
+func finite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 func userAgent(value string) string {

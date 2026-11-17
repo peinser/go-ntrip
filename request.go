@@ -3,13 +3,15 @@ package ntrip
 import (
 	"encoding/base64"
 	"fmt"
-	"net"
+	"net/http"
 	"sort"
 	"strings"
-	"time"
 )
 
-func writeRequest(conn net.Conn, timeout time.Duration, method string, ep endpoint, userAgent string, credentials Credentials, headers map[string]string, extra map[string]string) error {
+func requestBytes(method string, ep endpoint, userAgent string, credentials Credentials, headers map[string]string, extra map[string]string) ([]byte, error) {
+	if !cleanHeader("User-Agent", userAgent) || !cleanHeader("Host", ep.Host) || strings.Contains(credentials.Username, ":") {
+		return nil, fmt.Errorf("%w: invalid user agent, host, or Basic authentication username", ErrInvalidConfig)
+	}
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "%s %s HTTP/1.1\r\n", method, ep.PathQuery)
 	merged := map[string]string{
@@ -23,17 +25,26 @@ func writeRequest(conn net.Conn, timeout time.Duration, method string, ep endpoi
 		merged["Authorization"] = "Basic " + base64.StdEncoding.EncodeToString([]byte(value))
 	}
 	for key, value := range extra {
-		if cleanHeader(key, value) {
-			merged[key] = value
-		}
+		merged[key] = value
 	}
 	for key, value := range headers {
-		if strings.EqualFold(key, "Host") || strings.EqualFold(key, "Authorization") {
-			continue
+		if !cleanHeader(key, value) {
+			return nil, fmt.Errorf("%w: invalid header %q", ErrInvalidConfig, key)
 		}
-		if cleanHeader(key, value) {
-			merged[key] = value
+		name := http.CanonicalHeaderKey(key)
+		if name == "Ntrip-Gga" {
+			if err := ValidateGGA(value); err != nil {
+				return nil, fmt.Errorf("Ntrip-GGA header: %w", err)
+			}
 		}
+		switch name {
+		case "Host", "Authorization", "User-Agent", "Ntrip-Version", "Connection", "Transfer-Encoding", "Content-Length", "Content-Type", "Content-Encoding", "Trailer", "Expect", "Upgrade":
+			return nil, fmt.Errorf("%w: header %q is managed by the transport", ErrInvalidConfig, key)
+		}
+		if _, exists := merged[name]; exists {
+			return nil, fmt.Errorf("%w: duplicate header %q", ErrInvalidConfig, key)
+		}
+		merged[name] = value
 	}
 	keys := make([]string, 0, len(merged))
 	for key := range merged {
@@ -44,15 +55,29 @@ func writeRequest(conn net.Conn, timeout time.Duration, method string, ep endpoi
 		fmt.Fprintf(&builder, "%s: %s\r\n", key, merged[key])
 	}
 	builder.WriteString("\r\n")
-	return writeFull(conn, []byte(builder.String()), timeout)
+	return []byte(builder.String()), nil
 }
 
 func cleanHeader(key, value string) bool {
-	return key != "" && !strings.ContainsAny(key, "\r\n:") && !strings.ContainsAny(value, "\r\n")
+	if key == "" {
+		return false
+	}
+	for i := range key {
+		c := key[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c))) {
+			return false
+		}
+	}
+	for i := range value {
+		if (value[i] < 32 && value[i] != '\t') || value[i] == 127 {
+			return false
+		}
+	}
+	return true
 }
 
 func expectOK(resp response) error {
-	if resp.Code >= 200 && resp.Code <= 299 {
+	if resp.Code == http.StatusOK {
 		return nil
 	}
 	return &StatusError{Code: resp.Code, Status: resp.Status}

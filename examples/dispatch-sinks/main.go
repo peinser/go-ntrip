@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -33,15 +35,6 @@ func main() {
 		log.Fatal("-url is required")
 	}
 
-	sinks, closeSinks, err := openSinks(udpAddr, filePath, devicePath, stdout)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer closeSinks()
-	if len(sinks) == 0 {
-		log.Fatal("at least one sink is required: -udp, -file, -device, or -stdout")
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -51,7 +44,8 @@ func main() {
 		ReadIdleTimeout: 60 * time.Second,
 		ReconnectOnEOF:  true,
 	})
-	sentence, err := ntrip.FormatGGA(ntrip.GGA{Time: time.Now().UTC(), Latitude: lat, Longitude: lon, AltitudeMeters: alt, FixQuality: ntrip.FixGPS, Satellites: 12, HDOP: 1.0})
+	position := ntrip.GGA{Latitude: lat, Longitude: lon, AltitudeMeters: alt, FixQuality: ntrip.FixGPS, Satellites: 12, HDOP: 1.0}
+	sentence, err := ntrip.FormatGGA(position)
 	if err != nil {
 		log.Fatalf("format gga: %v", err)
 	}
@@ -59,45 +53,92 @@ func main() {
 		log.Fatalf("set gga: %v", err)
 	}
 
-	writer := io.MultiWriter(sinks...)
-	if err := stream.RunToWriter(ctx, writer); err != nil && ctx.Err() == nil {
+	writer, err := openSinks(udpAddr, filePath, devicePath, stdout)
+	if err != nil {
+		log.Fatal(err)
+	}
+	updatesCtx, stopUpdates := context.WithCancel(ctx)
+	updatesDone := make(chan struct{})
+	go func() {
+		defer close(updatesDone)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-updatesCtx.Done():
+				return
+			case <-ticker.C:
+				position.Time = time.Now().UTC()
+				sentence, err := ntrip.FormatGGA(position)
+				if err == nil {
+					err = stream.SetGGA(sentence)
+				}
+				if err != nil {
+					log.Printf("update GGA: %v", err)
+				}
+			}
+		}
+	}()
+	err = stream.RunToWriter(ctx, writer)
+	stopUpdates()
+	<-updatesDone
+	if err != nil && ctx.Err() == nil {
 		log.Fatalf("ntrip stream stopped: %v", err)
 	}
 }
 
-func openSinks(udpAddr, filePath, devicePath string, stdout bool) ([]io.Writer, func(), error) {
+type sinkGroup struct {
+	io.Writer
+	closers []io.Closer
+}
+
+func (s *sinkGroup) Close() error {
+	var err error
+	for _, closer := range s.closers {
+		err = errors.Join(err, closer.Close())
+	}
+	return err
+}
+
+func openSinks(udpAddr, filePath, devicePath string, stdout bool) (_ io.WriteCloser, err error) {
 	var sinks []io.Writer
-	var closers []io.Closer
+	group := &sinkGroup{}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, group.Close())
+		}
+	}()
 	if udpAddr != "" {
 		conn, err := net.Dial("udp", udpAddr)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		sinks = append(sinks, conn)
-		closers = append(closers, conn)
+		group.closers = append(group.closers, conn)
 	}
 	if filePath != "" {
 		file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		sinks = append(sinks, file)
-		closers = append(closers, file)
+		group.closers = append(group.closers, file)
 	}
 	if devicePath != "" {
 		device, err := os.OpenFile(devicePath, os.O_WRONLY, 0)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		sinks = append(sinks, device)
-		closers = append(closers, device)
+		group.closers = append(group.closers, device)
 	}
 	if stdout {
 		sinks = append(sinks, os.Stdout)
+		group.closers = append(group.closers, os.Stdout)
 	}
-	return sinks, func() {
-		for _, closer := range closers {
-			_ = closer.Close()
-		}
-	}, nil
+	if len(sinks) == 0 {
+		return nil, fmt.Errorf("at least one sink is required: -udp, -file, -device, or -stdout")
+	}
+	group.Writer = io.MultiWriter(sinks...)
+	return group, nil
 }

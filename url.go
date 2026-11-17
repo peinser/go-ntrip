@@ -2,7 +2,9 @@ package ntrip
 
 import (
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -26,24 +28,37 @@ func parseEndpoint(raw string) (endpoint, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return endpoint{}, fmt.Errorf("%w: unsupported url scheme %q", ErrInvalidConfig, u.Scheme)
 	}
-	if u.Host == "" {
+	if u.Hostname() == "" || u.Opaque != "" {
 		return endpoint{}, fmt.Errorf("%w: url host is required", ErrInvalidConfig)
 	}
 	if u.User != nil {
 		return endpoint{}, fmt.Errorf("%w: credentials in url are not supported", ErrInvalidConfig)
 	}
+	if u.Fragment != "" {
+		return endpoint{}, fmt.Errorf("%w: URL fragments are not supported", ErrInvalidConfig)
+	}
 	pathQuery := u.RequestURI()
 	if pathQuery == "" {
 		pathQuery = "/"
 	}
-	address := u.Host
-	if !strings.Contains(address, ":") {
-		if u.Scheme == "https" {
-			address += ":443"
-		} else {
-			address += ":2101"
+	for i := range pathQuery {
+		if pathQuery[i] <= 32 || pathQuery[i] >= 127 {
+			return endpoint{}, fmt.Errorf("%w: URL request target must be percent-encoded ASCII", ErrInvalidConfig)
 		}
 	}
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "2101"
+		}
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return endpoint{}, fmt.Errorf("%w: invalid URL port %q", ErrInvalidConfig, port)
+	}
+	address := net.JoinHostPort(u.Hostname(), port)
 	return endpoint{
 		URL:       u,
 		Network:   "tcp",

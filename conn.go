@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,9 +20,12 @@ type response struct {
 	Code   int
 	Status string
 	Header map[string][]string
+	Body   io.ReadCloser
 }
 
 func dial(ctx context.Context, ep endpoint, timeout time.Duration, dialer *net.Dialer, tlsConfig *tls.Config) (net.Conn, error) {
+	setupCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	if dialer == nil {
 		dialer = &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 	} else if dialer.Timeout == 0 {
@@ -27,8 +33,11 @@ func dial(ctx context.Context, ep endpoint, timeout time.Duration, dialer *net.D
 		copy.Timeout = timeout
 		dialer = &copy
 	}
-	conn, err := dialer.DialContext(ctx, ep.Network, ep.Address)
+	conn, err := dialer.DialContext(setupCtx, ep.Network, ep.Address)
 	if err != nil {
+		if setupCtx.Err() != nil && ctx.Err() == nil {
+			err = os.ErrDeadlineExceeded
+		}
 		return nil, fmt.Errorf("dial ntrip caster: %w", err)
 	}
 	if !ep.TLS {
@@ -44,40 +53,61 @@ func dial(ctx context.Context, ep endpoint, timeout time.Duration, dialer *net.D
 			cfg.MinVersion = tls.VersionTLS12
 		}
 	}
+	// This transport speaks HTTP/1.1 even when the supplied TLS config offers h2.
+	cfg.NextProtos = []string{"http/1.1"}
 	tlsConn := tls.Client(conn, cfg)
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = tlsConn.SetDeadline(deadline)
-	}
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
+	if err := tlsConn.HandshakeContext(setupCtx); err != nil {
 		_ = conn.Close()
+		if setupCtx.Err() != nil && ctx.Err() == nil {
+			err = os.ErrDeadlineExceeded
+		}
 		return nil, fmt.Errorf("handshake ntrip caster tls: %w", err)
 	}
-	_ = tlsConn.SetDeadline(time.Time{})
 	return tlsConn, nil
 }
 
-func closeOnContext(ctx context.Context, conn net.Conn) func() bool {
-	return context.AfterFunc(ctx, func() { _ = conn.Close() })
+// closeWithContext takes ownership of closer. The returned finalizer closes it
+// exactly once and joins an in-progress cancellation callback before returning.
+func closeWithContext(ctx context.Context, closer io.Closer) func() error {
+	var err error
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		err = closer.Close()
+		close(done)
+	})
+	var once sync.Once
+	return func() error {
+		once.Do(func() {
+			if stop() {
+				err = closer.Close()
+			} else {
+				<-done
+			}
+		})
+		return err
+	}
 }
 
-func writeFull(conn net.Conn, p []byte, timeout time.Duration) error {
+func writeFull(conn net.Conn, p []byte, timeout time.Duration) (int, error) {
 	if timeout > 0 {
 		if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-			return err
+			return 0, err
 		}
 		defer conn.SetWriteDeadline(time.Time{})
 	}
+	total := 0
 	for len(p) > 0 {
 		n, err := conn.Write(p)
+		total += n
 		if err != nil {
-			return err
+			return total, err
 		}
 		p = p[n:]
 		if n == 0 {
-			return io.ErrShortWrite
+			return total, io.ErrShortWrite
 		}
 	}
-	return nil
+	return total, nil
 }
 
 func withReadDeadline(conn net.Conn, timeout time.Duration, fn func() error) error {
@@ -92,64 +122,76 @@ func withReadDeadline(conn net.Conn, timeout time.Duration, fn func() error) err
 
 func readResponse(reader *bufio.Reader, limit uint64) (response, error) {
 	lr := &limitedLineReader{reader: reader, remaining: limit}
-	statusLine, err := lr.readLine()
-	if err != nil {
-		return response{}, fmt.Errorf("%w: read status line: %v", ErrBadResponse, err)
-	}
-	resp, err := parseStatusLine(statusLine)
-	if err != nil {
-		return response{}, err
-	}
-	resp.Header = make(map[string][]string)
 	for {
-		line, err := lr.readLine()
+		statusLine, err := lr.readLine()
 		if err != nil {
-			return response{}, fmt.Errorf("%w: read header: %v", ErrBadResponse, err)
+			return response{}, fmt.Errorf("%w: read status line: %w", ErrBadResponse, err)
 		}
-		if line == "" {
+		resp, err := parseStatusLine(statusLine)
+		if err != nil {
+			return response{}, err
+		}
+		if resp.Proto == "ICY" {
+			// Legacy ICY success consists of one status line followed immediately by
+			// binary data. Do not consume binary bytes looking for HTTP headers.
+			resp.Header = make(map[string][]string)
+			resp.Body = io.NopCloser(reader)
 			return resp, nil
 		}
-		name, value, ok := strings.Cut(line, ":")
-		if !ok {
-			return response{}, fmt.Errorf("%w: malformed header %q", ErrBadResponse, line)
+		var headers strings.Builder
+		headers.WriteString(statusLine + "\r\n")
+		for {
+			line, err := lr.readLine()
+			if err != nil {
+				return response{}, fmt.Errorf("%w: read header: %w", ErrBadResponse, err)
+			}
+			headers.WriteString(line + "\r\n")
+			if line == "" {
+				break
+			}
 		}
-		key := canonicalHeaderKey(strings.TrimSpace(name))
-		resp.Header[key] = append(resp.Header[key], strings.TrimSpace(value))
+		// Bound the header block first, then let net/http validate and decode HTTP
+		// framing (including exact Content-Length and chunk trailers). Its buffered
+		// reader owns any body bytes read ahead, so always read through parsed.Body.
+		var raw io.Reader = strings.NewReader(headers.String())
+		if resp.Code >= 200 {
+			raw = io.MultiReader(raw, reader)
+		}
+		// Informational responses must not read ahead into the next response:
+		// their temporary parser is discarded before reading the next header block.
+		parsed, err := http.ReadResponse(bufio.NewReader(raw), nil)
+		if err != nil {
+			return response{}, fmt.Errorf("%w: %w", ErrBadResponse, err)
+		}
+		if parsed.StatusCode >= 100 && parsed.StatusCode < 200 {
+			if parsed.StatusCode == http.StatusSwitchingProtocols {
+				return response{}, fmt.Errorf("%w: protocol switching is unsupported", ErrBadResponse)
+			}
+			continue
+		}
+		if parsed.StatusCode == http.StatusOK {
+			for _, encoding := range parsed.Header.Values("Content-Encoding") {
+				if !strings.EqualFold(encoding, "identity") {
+					return response{}, fmt.Errorf("%w: unsupported content encoding %q", ErrBadResponse, encoding)
+				}
+			}
+		}
+		resp.Header = parsed.Header
+		resp.Body = parsed.Body
+		return resp, nil
 	}
 }
 
 func parseStatusLine(line string) (response, error) {
-	if strings.HasPrefix(line, "ICY ") {
-		parts := strings.SplitN(line, " ", 3)
-		if len(parts) < 2 {
-			return response{}, fmt.Errorf("%w: malformed icy status %q", ErrBadResponse, line)
-		}
-		code, err := strconv.Atoi(parts[1])
-		if err != nil {
-			return response{}, fmt.Errorf("%w: malformed icy status %q", ErrBadResponse, line)
-		}
-		return response{Proto: "ICY", Code: code, Status: line}, nil
-	}
 	parts := strings.SplitN(line, " ", 3)
-	if len(parts) < 2 || !strings.HasPrefix(parts[0], "HTTP/") {
+	if len(parts) < 2 || (parts[0] != "HTTP/1.1" && parts[0] != "HTTP/1.0" && parts[0] != "ICY") || len(parts[1]) != 3 {
 		return response{}, fmt.Errorf("%w: malformed status line %q", ErrBadResponse, line)
 	}
 	code, err := strconv.Atoi(parts[1])
-	if err != nil {
+	if err != nil || code < 100 || code > 599 {
 		return response{}, fmt.Errorf("%w: malformed status line %q", ErrBadResponse, line)
 	}
 	return response{Proto: parts[0], Code: code, Status: line}, nil
-}
-
-func canonicalHeaderKey(key string) string {
-	parts := strings.Split(strings.ToLower(key), "-")
-	for i, part := range parts {
-		if part == "" {
-			continue
-		}
-		parts[i] = strings.ToUpper(part[:1]) + part[1:]
-	}
-	return strings.Join(parts, "-")
 }
 
 type limitedLineReader struct {
@@ -158,15 +200,23 @@ type limitedLineReader struct {
 }
 
 func (r *limitedLineReader) readLine() (string, error) {
-	line, err := r.reader.ReadString('\n')
-	if err != nil {
-		return "", err
+	var line []byte
+	for {
+		fragment, err := r.reader.ReadSlice('\n')
+		if uint64(len(fragment)) > r.remaining {
+			return "", fmt.Errorf("response headers exceed configured limit")
+		}
+		r.remaining -= uint64(len(fragment))
+		line = append(line, fragment...)
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if len(line) < 2 || line[len(line)-2] != '\r' {
+			return "", fmt.Errorf("response lines must end with CRLF")
+		}
+		return string(line[:len(line)-2]), nil
 	}
-	if uint64(len(line)) > r.remaining {
-		return "", fmt.Errorf("headers exceed %d bytes", r.remaining)
-	}
-	r.remaining -= uint64(len(line))
-	line = strings.TrimSuffix(line, "\n")
-	line = strings.TrimSuffix(line, "\r")
-	return line, nil
 }

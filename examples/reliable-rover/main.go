@@ -34,7 +34,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("dial udp sink: %v", err)
 	}
-	defer conn.Close()
 
 	stream := ntrip.NewRoverStream(ntrip.StreamConfig{
 		Rover: ntrip.RoverConfig{
@@ -47,10 +46,24 @@ func main() {
 		ReconnectOnEOF:  true,
 	})
 
-	go updateFixedGGA(ctx, stream, lat, lon, alt, 5*time.Second)
+	initial, err := ntrip.FormatGGA(ntrip.GGA{Latitude: lat, Longitude: lon, AltitudeMeters: alt, FixQuality: ntrip.FixGPS, Satellites: 12, HDOP: 1.0})
+	if err != nil {
+		_ = conn.Close()
+		log.Fatal(err)
+	}
+	if err := stream.SetGGA(initial); err != nil {
+		_ = conn.Close()
+		log.Fatal(err)
+	}
+	updatesCtx, stopUpdates := context.WithCancel(ctx)
+	updatesDone := make(chan struct{})
+	go func() { defer close(updatesDone); updateFixedGGA(updatesCtx, stream, lat, lon, alt, 5*time.Second) }()
 
 	log.Printf("streaming RTCM from %s to udp://%s", url, udpAddr)
-	if err := stream.RunToWriter(ctx, conn); err != nil && ctx.Err() == nil {
+	err = stream.RunToWriter(ctx, conn)
+	stopUpdates()
+	<-updatesDone
+	if err != nil && ctx.Err() == nil {
 		log.Fatalf("ntrip stream stopped: %v", err)
 	}
 	stats := stream.Stats()

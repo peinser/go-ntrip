@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -24,11 +23,10 @@ func main() {
 		log.Fatal("-url is required")
 	}
 
-	input, closeInput, err := openInput(filePath)
+	input, err := openInput(filePath)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer closeInput()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -46,13 +44,9 @@ func main() {
 	}
 }
 
-func openInput(path string) (io.Reader, func(), error) {
+func openInput(path string) (*os.File, error) {
 	if path == "" {
-		return os.Stdin, func() {}, nil
+		return os.Stdin, nil
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	return file, func() { _ = file.Close() }, nil
+	return os.Open(path)
 }

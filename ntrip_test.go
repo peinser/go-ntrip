@@ -69,7 +69,7 @@ func TestRoverFullDuplexGGA(t *testing.T) {
 	}
 }
 
-func TestSourcePUTChunked(t *testing.T) {
+func TestSourcePOSTChunked(t *testing.T) {
 	ln := listenTCP(t)
 	defer ln.Close()
 	methodCh := make(chan string, 1)
@@ -104,7 +104,7 @@ func TestSourcePUTChunked(t *testing.T) {
 	if n, err := source.Write([]byte("RTCM")); err != nil || n != 4 {
 		t.Fatalf("source.Write() = %d, %v", n, err)
 	}
-	if got := <-methodCh; got != "PUT" {
+	if got := <-methodCh; got != "POST" {
 		t.Fatalf("method = %q", got)
 	}
 	if got := <-bodyCh; got != "4:RTCM" {
@@ -201,7 +201,7 @@ func TestSourcetableWarningsLookupAndNearest(t *testing.T) {
 		t.Fatalf("Network() = %+v, %v", network, ok)
 	}
 	nearest := st.NearestStreams(50.85, 4.35, 0)
-	if len(nearest) != 3 || nearest[0].Stream.Mountpoint != "BAD" && nearest[0].Stream.Mountpoint != "NEAR" {
+	if len(nearest) != 2 || nearest[0].Stream.Mountpoint != "NEAR" {
 		t.Fatalf("nearest = %+v", nearest)
 	}
 	if !strings.Contains(st.String(), "ENDSOURCETABLE\r\n") {
@@ -243,7 +243,7 @@ func TestRoverStreamReconnectsAndResendsGGA(t *testing.T) {
 		t.Fatalf("SetGGA() = %v", err)
 	}
 	read := 0
-	err := stream.Run(ctx, func(p []byte) error {
+	err := stream.Run(ctx, func(_ context.Context, p []byte) error {
 		read += len(p)
 		if read >= 2 {
 			cancel()
@@ -327,7 +327,7 @@ func TestRoverStreamReadIdleReconnects(t *testing.T) {
 		ReconnectOnEOF:  true,
 	})
 	read := 0
-	err := stream.Run(ctx, func(p []byte) error {
+	err := stream.Run(ctx, func(_ context.Context, p []byte) error {
 		read += len(p)
 		cancel()
 		return nil
@@ -362,7 +362,7 @@ func TestRoverStreamStopsOnUnauthorized(t *testing.T) {
 		Rover:     RoverConfig{URL: "http://" + ln.Addr().String() + "/ANY"},
 		Reconnect: BackoffConfig{Min: time.Millisecond, Max: time.Millisecond},
 	})
-	err := stream.Run(context.Background(), func([]byte) error { return nil })
+	err := stream.Run(context.Background(), func(context.Context, []byte) error { return nil })
 	var status *StatusError
 	if !errors.As(err, &status) || status.Code != 401 {
 		t.Fatalf("err = %v", err)

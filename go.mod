@@ -1,5 +1,3 @@
 module github.com/peinser/go-ntrip
 
-go 1.25
-
-toolchain go1.25.10
+go 1.27.4
